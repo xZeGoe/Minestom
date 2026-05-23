@@ -145,8 +145,14 @@ public final class PacketReading {
         try {
             packetLength = buffer.read(VAR_INT);
         } catch (IndexOutOfBoundsException e) {
-            // Couldn't read a single var-int
-            return new Result.Failure<>(MAX_VAR_INT_SIZE);
+            // Couldn't read a single var-int.  Return Failure only
+            // when the buffer is truly too small; otherwise the
+            // VarInt guard in NetworkBufferTypeImpl rejected a
+            // writeIndex crossing and we need more data.
+            if (beginMark + MAX_VAR_INT_SIZE > buffer.capacity())
+                return new Result.Failure<>(MAX_VAR_INT_SIZE);
+            buffer.readIndex(beginMark);
+            return EMPTY_CLIENT_PACKET;
         }
         final long readerStart = buffer.readIndex();
         if (readerStart > buffer.writeIndex()) {
