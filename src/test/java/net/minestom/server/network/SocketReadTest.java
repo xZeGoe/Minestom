@@ -1,20 +1,35 @@
 package net.minestom.server.network;
 
+import net.minestom.server.Auth;
+import net.minestom.server.MinecraftServer;
+import net.minestom.server.listener.preplay.LoginListener;
 import net.minestom.server.network.packet.PacketReading;
 import net.minestom.server.network.packet.PacketVanilla;
 import net.minestom.server.network.packet.PacketWriting;
 import net.minestom.server.network.packet.client.ClientPacket;
 import net.minestom.server.network.packet.client.common.ClientPluginMessagePacket;
+import net.minestom.server.network.packet.client.login.ClientLoginAcknowledgedPacket;
+import net.minestom.server.network.player.GameProfile;
+import net.minestom.server.network.player.PlayerSocketConnection;
+import net.minestom.server.network.packet.client.handshake.ClientHandshakePacket;
+import net.minestom.server.network.packet.client.login.ClientLoginStartPacket;
 import net.minestom.server.registry.Registries;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.net.InetSocketAddress;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.util.List;
 import java.util.zip.DataFormatException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class SocketReadTest {
 
@@ -169,6 +184,79 @@ public class SocketReadTest {
                     "Decompressed pool buffer must inherit the source buffer's registries");
         } finally {
             PacketVanilla.PACKET_POOL.add(pooled);
+        }
+    }
+
+    @Test
+    public void truncatedVarIntPayloadDoesNotConsumeNextFrameByte() {
+        final var buffer = NetworkBuffer.resizableBuffer();
+        buffer.write(NetworkBuffer.VAR_INT, 2);
+        buffer.write(NetworkBuffer.VAR_INT, 0);
+        buffer.write(NetworkBuffer.BYTE, (byte) 0x80);
+        buffer.write(NetworkBuffer.VAR_INT, 1);
+        buffer.write(NetworkBuffer.VAR_INT, 0);
+
+        assertThrows(RuntimeException.class,
+                () -> PacketReading.readClient(buffer, ConnectionState.PLAY, false),
+                "Truncated payload must not be completed from the next frame byte");
+    }
+
+    @Test
+    public void forgedLoginAcknowledgedCreatesPlayerInOfflineMode() throws Exception {
+        MinecraftServer.init();
+        MinecraftServer.setCompressionThreshold(0);
+
+        final var serverChannel = ServerSocketChannel.open();
+        serverChannel.bind(new InetSocketAddress("127.0.0.1", 0));
+        final int port = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
+
+        try (final var clientChannel = SocketChannel.open(new InetSocketAddress("127.0.0.1", port));
+             final var acceptedChannel = serverChannel.accept()) {
+
+            final var connection = new PlayerSocketConnection(
+                    acceptedChannel, acceptedChannel.getRemoteAddress(),
+                    Thread.currentThread(), Thread.currentThread());
+
+            final var packetParser = PacketVanilla.CLIENT_PACKET_PARSER;
+            assertEquals(0, MinecraftServer.getConnectionManager().getOnlinePlayerCount());
+
+            // ---- send handshake + login start ----
+            final var handshake = NetworkBuffer.resizableBuffer();
+            PacketWriting.writeFramedPacket(handshake, ConnectionState.HANDSHAKE,
+                    new ClientHandshakePacket(776, "", port, ClientHandshakePacket.Intent.LOGIN), 0);
+            final var loginStart = NetworkBuffer.resizableBuffer();
+            PacketWriting.writeFramedPacket(loginStart, ConnectionState.LOGIN,
+                    new ClientLoginStartPacket("ExploitPlayer", java.util.UUID.randomUUID()), 0);
+
+            final byte[] preamble = new byte[(int) (handshake.writeIndex() + loginStart.writeIndex())];
+            handshake.copyTo(0, preamble, 0, handshake.writeIndex());
+            loginStart.copyTo(0, preamble, (int) handshake.writeIndex(), loginStart.writeIndex());
+            clientChannel.write(java.nio.ByteBuffer.wrap(preamble));
+
+            connection.read(packetParser);
+
+            // ---- wait for enterConfig to set gameProfile ----
+            final long deadline = System.currentTimeMillis() + 5000;
+            while (connection.gameProfile() == null && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+            assertNotNull(connection.gameProfile(), "gameProfile should be set after login start");
+
+            // ---- send forged LoginAcknowledged: 00 03 ----
+            // Frame 1 length=0, packet ID 0x00 stolen byte is
+            // not relevant; VarInt for packet ID crosses boundary
+            // and reads 0x03 = ClientLoginAcknowledgedPacket in LOGIN.
+            final byte[] exploit = {(byte) 0x00, (byte) 0x03};
+            clientChannel.write(java.nio.ByteBuffer.wrap(exploit));
+
+            assertThrows(IndexOutOfBoundsException.class,
+                    () -> connection.read(packetParser),
+                    "Truncated VarInt should not be completed from the next frame byte");
+
+            assertNull(MinecraftServer.getConnectionManager().getPlayer(connection),
+                    "forged LoginAcknowledged should NOT create a Player");
+        } finally {
+            serverChannel.close();
         }
     }
 
